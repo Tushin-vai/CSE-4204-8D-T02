@@ -38,7 +38,7 @@ Built-in chatbot allowing users to ask follow-up questions about their report. C
 **Report History: **
 All past reports, AI summaries, and chat conversations saved per account. Users can revisit any prior report and continue asking questions. 
 
- Initial Technology Stack
+
 
 ---
 
