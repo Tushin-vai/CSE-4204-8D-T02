@@ -22,33 +22,23 @@ Users can then ask follow-up questions about their report through a built-in cha
 **Core Features : **
 
 **Authentication System: **
-
 User registration and login with JWT-based secure sessions. Private, per-user data isolation ensuring reports are only accessible by their owner. 
 
 **Report Input & Upload: **
-
 Text input field for pasting report content directly. 
-
 File upload support for PDF and image-based reports. 
-
 OCR and vision processing for scanned documents via OpenAI Vision. 
 
 **AI-Powered Analysis Dashboard: **
-
 Automatically generated plain-language summary of the report. Structured extraction of key findings: diagnoses, lab values, medications. Flagging of abnormal results for immediate user attention. 
 
 **Interactive Q&A Chatbot: **
-
 Built-in chatbot allowing users to ask follow-up questions about their report. Context-aware responses grounded in the specific report content. Conversational interface for a natural user experience 
 
-. 
-
 **Report History: **
-
 All past reports, AI summaries, and chat conversations saved per account. Users can revisit any prior report and continue asking questions. 
 
- 
-Initial Technology Stack
+ Initial Technology Stack
 
 ---
 
