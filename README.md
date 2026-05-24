@@ -47,38 +47,35 @@ Built-in chatbot allowing users to ask follow-up questions about their report. C
 All past reports, AI summaries, and chat conversations saved per account. Users can revisit any prior report and continue asking questions. 
 
  
+Initial Technology Stack
 
-**Technology Stack **
+---
 
-**Layer** **Technology** **Purpose**
+### 🔹 Core Architecture
 
-Upload page, summary dashboard, 
+| Layer | Technology | Purpose |
+| :--- | :--- | :--- |
+| **Frontend** | React.js | • Upload page <br> • Summary dashboard <br> • Chatbot panel <br> • Report history <br> • Authentication |
+| | | |
+| **Backend** | Node.js + Express.js | **REST API Endpoints:** <br><br> • `POST /upload` <br> • `POST /summarize` <br> • `POST /chat` <br> • `GET /reports` <br> • `POST /auth` |
+| | | |
+| **Database** | PostgreSQL (Supabase) | **Relational Tables:** <br><br> • `users` <br> • `reports` <br> • `summaries` <br> • `chat_history` |
+| | | |
+| **File Storage** | Supabase Storage | Store and manage uploaded PDF documents and image files |
+| | | |
+| **AI Integration** | OpenAI GPT-4o | • Document summarization <br> • Interactive Q&A chatbot <br> • Key entity extraction <br> • Vision & OCR processing |
+| | | |
+| **Authentication** | JWT (JSON Web Tokens) | Secure, stateless per-user sessions |
 
-Frontend React.js 
+---
 
-chatbot panel, report history, auth 
+### 🚀 Deployment & Hosting
 
-REST API: /upload, /summarize, 
+| Layer | Hosting Provider | Target |
+| :--- | :--- | :--- |
+| **Frontend Deployment** | Vercel | Production hosting for the React web app |
+| | | |
+| **Backend Deployment** | Render | Production hosting for the Express server API |
 
-Backend Node.js \+ Express.js 
-
-/chat, /reports, /auth 
-
-Tables: users, reports, summaries, 
-
-Database PostgreSQL via Supabase 
-
-chat\_history 
-
-File Storage Supabase Storage Store uploaded PDF/image files 
-
-Summarization, Q&A chatbot, key 
-
-AI OpenAI 
-
-entity extraction, vision/OCR 
-
-Auth JWT \(JSON Web Tokens\) Secure per-user sessions
-
-
+---
 
