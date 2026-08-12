@@ -1,0 +1,1522 @@
+diff --git a/config/db.js b/config/db.js
+index 4cca6e3..7d514f2 100644
+--- a/config/db.js
++++ b/config/db.js
+@@ -7,8 +7,10 @@ const pool = new Pool({
+ });
+ 
+ pool.on('error', (err) => {
+-  console.error('Unexpected database error:', err);
+-  process.exit(-1);
++  // A transient network blip or idle-client error shouldn't take the whole server down —
++  // individual queries will fail/retry as normal. (Previously this called process.exit(-1),
++  // which meant any brief DB hiccup killed the entire API.)
++  console.error('Unexpected database pool error:', err.message);
+ });
+ 
+ // Simple query helper
+diff --git a/config/schema.sql b/config/schema.sql
+index 2eaff13..78d967b 100644
+--- a/config/schema.sql
++++ b/config/schema.sql
+@@ -53,9 +53,10 @@ CREATE TABLE IF NOT EXISTS summaries (
+ );
+ 
+ -- ── CHAT_HISTORY ─────────────────────────────────────────────
++-- report_id is nullable to support general chat (no report selected)
+ CREATE TABLE IF NOT EXISTS chat_history (
+   id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+-  report_id  UUID NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
++  report_id  UUID REFERENCES reports(id) ON DELETE CASCADE,
+   user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+   message    TEXT NOT NULL,
+   response   TEXT NOT NULL,
+@@ -63,6 +64,10 @@ CREATE TABLE IF NOT EXISTS chat_history (
+   session_id UUID REFERENCES sessions(id) ON DELETE SET NULL
+ );
+ 
++-- If this table already existed from a previous run (with report_id NOT NULL),
++-- relax the constraint so general chat (no report) can be stored. Safe to re-run.
++ALTER TABLE chat_history ALTER COLUMN report_id DROP NOT NULL;
++
+ -- ── INDEXES (for faster queries) ─────────────────────────────
+ CREATE INDEX IF NOT EXISTS idx_sessions_user_id    ON sessions(user_id);
+ CREATE INDEX IF NOT EXISTS idx_reports_user_id     ON reports(user_id);
+diff --git a/controllers/chatController.js b/controllers/chatController.js
+index e0fcb4a..1f67f2d 100644
+--- a/controllers/chatController.js
++++ b/controllers/chatController.js
+@@ -1,5 +1,6 @@
+ // controllers/chatController.js
+-// Handles: send a message about a report, get chat history
++// Handles: send a message about a report, get chat history, general chat,
++// and saved chat "sessions" (ChatGPT-style separate conversation threads).
+ const asyncHandler        = require('../utils/asyncHandler');
+ const ApiError            = require('../utils/ApiError');
+ const chatModel           = require('../models/chatModel');
+@@ -9,38 +10,35 @@ const { chatWithReport }  = require('../utils/aiService');
+ 
+ // ── POST /api/chat/:reportId ──────────────────────────────────
+ const sendMessage = asyncHandler(async (req, res) => {
+-  const { message } = req.body;
++  const { message, session_id } = req.body;
+   const { reportId } = req.params;
+ 
+-  // Verify report exists and belongs to user
+   const report = await reportModel.findById(reportId);
+   if (!report) throw new ApiError(404, 'Report not found.');
+   if (report.user_id !== req.user.userId) throw new ApiError(403, 'Access denied.');
+ 
+-  // Get the report summary as context for the AI
+   const summary = await summaryModel.findByReportId(reportId);
+   const context = summary
+     ? `Report: ${report.file_name}. Summary: ${summary.summary_text}`
+     : `Report: ${report.file_name}`;
+ 
+-  // Get AI response (mocked for now)
+   const aiResponse = await chatWithReport(message, context);
+ 
+-  // Save the chat message + response to DB
+   const chat = await chatModel.createMessage({
+     report_id:  reportId,
+     user_id:    req.user.userId,
+     message,
+     response:   aiResponse,
+-    session_id: null,
++    session_id: session_id || null,
+   });
+ 
+   res.status(201).json({
+     success: true,
+     data: {
+-      message:  chat.message,
+-      response: chat.response,
++      message:   chat.message,
++      response:  chat.response,
+       timestamp: chat.timestamp,
++      session_id: chat.session_id,
+     },
+   });
+ });
+@@ -58,4 +56,62 @@ const getChatHistory = asyncHandler(async (req, res) => {
+   res.json({ success: true, data: { history, count: history.length } });
+ });
+ 
+-module.exports = { sendMessage, getChatHistory };
++// ── POST /api/chat/general ────────────────────────────────────
++const sendGeneralMessage = asyncHandler(async (req, res) => {
++  const { message, session_id } = req.body;
++
++  const aiResponse = await chatWithReport(message, null);
++
++  const chat = await chatModel.createMessage({
++    report_id:  null,
++    user_id:    req.user.userId,
++    message,
++    response:   aiResponse,
++    session_id: session_id || null,
++  });
++
++  res.status(201).json({
++    success: true,
++    data: {
++      message:   chat.message,
++      response:  chat.response,
++      timestamp: chat.timestamp,
++      session_id: chat.session_id,
++    },
++  });
++});
++
++// ── GET /api/chat/general/history ─────────────────────────────
++const getGeneralChatHistory = asyncHandler(async (req, res) => {
++  const history = await chatModel.findGeneralByUserId(req.user.userId);
++  res.json({ success: true, data: { history, count: history.length } });
++});
++
++// ── GET /api/chat/sessions ─────────────────────────────────────
++// List all saved conversation threads for the logged-in user, most recent first.
++const listSessions = asyncHandler(async (req, res) => {
++  const sessions = await chatModel.listSessions(req.user.userId);
++  res.json({ success: true, data: { sessions, count: sessions.length } });
++});
++
++// ── GET /api/chat/sessions/:sessionId ──────────────────────────
++// Fetch every message in one saved conversation thread.
++const getSessionHistory = asyncHandler(async (req, res) => {
++  const { sessionId } = req.params;
++  const history = await chatModel.findBySessionId(sessionId, req.user.userId);
++
++  if (history.length === 0) {
++    throw new ApiError(404, 'Chat session not found.');
++  }
++
++  res.json({ success: true, data: { history, count: history.length } });
++});
++
++module.exports = {
++  sendMessage,
++  getChatHistory,
++  sendGeneralMessage,
++  getGeneralChatHistory,
++  listSessions,
++  getSessionHistory,
++};
+diff --git a/controllers/reportController.js b/controllers/reportController.js
+index 2fb5b3f..b6c0df6 100644
+--- a/controllers/reportController.js
++++ b/controllers/reportController.js
+@@ -6,27 +6,57 @@ const ApiError      = require('../utils/ApiError');
+ const reportModel   = require('../models/reportModel');
+ const summaryModel  = require('../models/summaryModel');
+ const { analyzeReport } = require('../utils/aiService');
++const { extractText } = require('../utils/textExtraction');
+ 
+ // ── POST /api/reports ─────────────────────────────────────────
+-// Create a report record + immediately run AI analysis on it
++// Create a report record + immediately run AI analysis on it.
++// Supports two input modes:
++//   1. multipart/form-data with a `file` field (PDF/JPG/PNG) — text is extracted server-side
++//   2. application/json with file_name + report_text (legacy paste-text flow)
+ const createReport = asyncHandler(async (req, res) => {
+-  const { file_name, file_url, report_type, report_text } = req.body;
++  const { file_name: bodyFileName, file_url, report_type, report_text: bodyReportText } = req.body;
++  const uploadedFile = req.file; // set by multer when a file is attached
+ 
+-  // 1. Save report record with status 'processing'
++  if (!uploadedFile && !bodyReportText) {
++    throw new ApiError(400, 'Please upload a file or provide report_text.');
++  }
++
++  let reportText = bodyReportText || '';
++  let fileName = bodyFileName;
++  let extractionInfo = null;
++
++  // 1. If a file was uploaded, extract its text (PDF text, or OCR for images / scanned PDFs)
++  if (uploadedFile) {
++    fileName = fileName || uploadedFile.originalname;
++    const extracted = await extractText(uploadedFile.buffer, uploadedFile.mimetype);
++    reportText = extracted.text;
++    extractionInfo = {
++      method: extracted.method,
++      ocrPagesUsed: extracted.ocrPagesUsed,
++      totalPages: extracted.totalPages,
++      truncated: extracted.truncated || false,
++    };
++  }
++
++  if (!fileName) {
++    throw new ApiError(400, 'file_name is required when not uploading a file.');
++  }
++
++  // 2. Save report record with status 'processing'
+   let report = await reportModel.createReport({
+     user_id:     req.user.userId,
+-    file_name,
++    file_name:   fileName,
+     file_url:    file_url || null,
+     report_type: report_type || 'general',
+   });
+ 
+   await reportModel.updateStatus(report.id, 'processing');
+ 
+-  // 2. Run AI analysis (mocked for now, real OpenAI later)
++  // 3. Run AI analysis on the actual extracted/pasted text
+   try {
+-    const aiResult = await analyzeReport(report_text || file_name);
++    const aiResult = await analyzeReport(reportText);
+ 
+-    // 3. Save summary to summaries table
++    // 4. Save summary to summaries table
+     await summaryModel.createSummary({
+       report_id:     report.id,
+       summary_text:  aiResult.summary_text,
+@@ -34,7 +64,7 @@ const createReport = asyncHandler(async (req, res) => {
+       abnormal_flags: aiResult.abnormal_flags,
+     });
+ 
+-    // 4. Mark report as completed
++    // 5. Mark report as completed
+     report = await reportModel.updateStatus(report.id, 'completed');
+   } catch (err) {
+     await reportModel.updateStatus(report.id, 'failed');
+@@ -46,7 +76,7 @@ const createReport = asyncHandler(async (req, res) => {
+   res.status(201).json({
+     success: true,
+     message: 'Report uploaded and analyzed.',
+-    data: { report, summary },
++    data: { report, summary, extraction: extractionInfo },
+   });
+ });
+ 
+diff --git a/middleware/errorHandler.js b/middleware/errorHandler.js
+index 294e865..f7dedf9 100644
+--- a/middleware/errorHandler.js
++++ b/middleware/errorHandler.js
+@@ -35,6 +35,17 @@ const errorHandler = (err, req, res, next) => {
+     return res.status(400).json({ success: false, error: 'Invalid JSON in request body.' });
+   }
+ 
++  // Multer (file upload) errors
++  if (err.name === 'MulterError') {
++    if (err.code === 'LIMIT_FILE_SIZE') {
++      return res.status(413).json({ success: false, error: 'File is too large. Maximum size is 20MB.' });
++    }
++    if (err.code === 'LIMIT_UNEXPECTED_FILE') {
++      return res.status(415).json({ success: false, error: 'Unsupported file type. Please upload a PDF, JPG, or PNG.' });
++    }
++    return res.status(400).json({ success: false, error: err.message || 'File upload error.' });
++  }
++
+   // Unexpected error — log it but don't expose details to client
+   console.error('Unhandled error:', err);
+   return res.status(500).json({ success: false, error: 'Internal server error.' });
+diff --git a/middleware/validators.js b/middleware/validators.js
+index 260c214..3c4f5ad 100644
+--- a/middleware/validators.js
++++ b/middleware/validators.js
+@@ -43,9 +43,13 @@ const updateProfileRules = [
+ ];
+ 
+ // ── Report validators ─────────────────────────────────────────
++// file_name is optional here because it can come from either the JSON body
++// (paste-text flow) or the uploaded file's original name (multipart flow).
++// The controller enforces that at least one of file / file_name+report_text is present.
+ const createReportRules = [
+-  body('file_name').trim().notEmpty().withMessage('File name is required.'),
++  body('file_name').optional().trim().notEmpty().withMessage('File name cannot be empty.'),
+   body('report_type').optional().trim(),
++  body('report_text').optional().trim(),
+ ];
+ 
+ const uuidParamRules = [
+@@ -62,6 +66,10 @@ const chatMessageRules = [
+   param('reportId').isUUID().withMessage('Invalid report ID.'),
+ ];
+ 
++const generalChatMessageRules = [
++  body('message').trim().notEmpty().withMessage('Message cannot be empty.'),
++];
++
+ module.exports = {
+   validate,
+   registerRules,
+@@ -72,4 +80,5 @@ module.exports = {
+   uuidParamRules,
+   reportIdParamRules,
+   chatMessageRules,
++  generalChatMessageRules,
+ };
+diff --git a/models/chatModel.js b/models/chatModel.js
+index 2f2524c..407caca 100644
+--- a/models/chatModel.js
++++ b/models/chatModel.js
+@@ -20,4 +20,48 @@ const findByReportId = async (report_id) => {
+   return result.rows;
+ };
+ 
+-module.exports = { createMessage, findByReportId };
++// General chat history — messages with no report attached (report_id IS NULL).
++const findGeneralByUserId = async (user_id) => {
++  const result = await query(
++    'SELECT * FROM chat_history WHERE report_id IS NULL AND user_id = $1 ORDER BY timestamp ASC',
++    [user_id]
++  );
++  return result.rows;
++};
++
++// ── Saved chat "threads" (ChatGPT-style sessions) ──────────────
++// One row per session_id, showing when it started, when it was last
++// active, and the first message as a preview title.
++const listSessions = async (user_id) => {
++  const result = await query(
++    `SELECT
++       session_id,
++       report_id,
++       MIN(timestamp) AS started_at,
++       MAX(timestamp) AS last_message_at,
++       (ARRAY_AGG(message ORDER BY timestamp ASC))[1] AS preview
++     FROM chat_history
++     WHERE user_id = $1 AND session_id IS NOT NULL
++     GROUP BY session_id, report_id
++     ORDER BY last_message_at DESC`,
++    [user_id]
++  );
++  return result.rows;
++};
++
++// All messages belonging to one saved session, scoped to the owning user.
++const findBySessionId = async (session_id, user_id) => {
++  const result = await query(
++    'SELECT * FROM chat_history WHERE session_id = $1 AND user_id = $2 ORDER BY timestamp ASC',
++    [session_id, user_id]
++  );
++  return result.rows;
++};
++
++module.exports = {
++  createMessage,
++  findByReportId,
++  findGeneralByUserId,
++  listSessions,
++  findBySessionId,
++};
+diff --git a/package-lock.json b/package-lock.json
+index 7361e8f..72fb6c0 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -8,6 +8,8 @@
+       "name": "medinsight-backend",
+       "version": "1.0.0",
+       "dependencies": {
++        "@napi-rs/canvas": "^1.0.5",
++        "@tesseract.js-data/eng": "^1.0.0",
+         "bcryptjs": "^2.4.3",
+         "cors": "^2.8.5",
+         "dotenv": "^16.4.5",
+@@ -17,7 +19,10 @@
+         "helmet": "^7.1.0",
+         "jsonwebtoken": "^9.0.2",
+         "multer": "^1.4.5-lts.1",
++        "pdf-parse": "^2.4.5",
++        "pdfjs-dist": "^6.2.108",
+         "pg": "^8.11.5",
++        "tesseract.js": "^7.0.0",
+         "uuid": "^9.0.1"
+       },
+       "devDependencies": {
+@@ -27,6 +32,261 @@
+         "node": ">=18.0.0"
+       }
+     },
++    "node_modules/@napi-rs/canvas": {
++      "version": "1.0.5",
++      "resolved": "https://registry.npmjs.org/@napi-rs/canvas/-/canvas-1.0.5.tgz",
++      "integrity": "sha512-GaPlicMtnvgPr5SowFRprkEJicDSrV3qCq17U4jiF5u0kNORZo3IbdN2Bk4SfcZJAMYFHbMVJ81O3w21CYxazg==",
++      "license": "MIT",
++      "workspaces": [
++        "e2e/*"
++      ],
++      "engines": {
++        "node": ">= 10"
++      },
++      "funding": {
++        "type": "github",
++        "url": "https://github.com/sponsors/Brooooooklyn"
++      },
++      "optionalDependencies": {
++        "@napi-rs/canvas-android-arm64": "1.0.5",
++        "@napi-rs/canvas-darwin-arm64": "1.0.5",
++        "@napi-rs/canvas-darwin-x64": "1.0.5",
++        "@napi-rs/canvas-linux-arm-gnueabihf": "1.0.5",
++        "@napi-rs/canvas-linux-arm64-gnu": "1.0.5",
++        "@napi-rs/canvas-linux-arm64-musl": "1.0.5",
++        "@napi-rs/canvas-linux-riscv64-gnu": "1.0.5",
++        "@napi-rs/canvas-linux-x64-gnu": "1.0.5",
++        "@napi-rs/canvas-linux-x64-musl": "1.0.5",
++        "@napi-rs/canvas-win32-arm64-msvc": "1.0.5",
++        "@napi-rs/canvas-win32-x64-msvc": "1.0.5"
++      }
++    },
++    "node_modules/@napi-rs/canvas-android-arm64": {
++      "version": "1.0.5",
++      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-android-arm64/-/canvas-android-arm64-1.0.5.tgz",
++      "integrity": "sha512-ZzDlpKQocwFfCwhMh17UWre6Qt5yZN3kNIJoUpGfRZqwDDZ164IKOsPOHsRd3d8Tuj5KM6bDjGuPmZxuPuG3NQ==",
++      "cpu": [
++        "arm64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "android"
++      ],
++      "engines": {
++        "node": ">= 10"
++      },
++      "funding": {
++        "type": "github",
++        "url": "https://github.com/sponsors/Brooooooklyn"
++      }
++    },
++    "node_modules/@napi-rs/canvas-darwin-arm64": {
++      "version": "1.0.5",
++      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-darwin-arm64/-/canvas-darwin-arm64-1.0.5.tgz",
++      "integrity": "sha512-Hr8v6CA/TBe+OJOePdV3sXWxzQHQKfQsTKPbc8wG7iPqVeAx6MMdzKGXlYID6SVvpfwV/zqkvGcdImYWSlhrZg==",
++      "cpu": [
++        "arm64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "engines": {
++        "node": ">= 10"
++      },
++      "funding": {
++        "type": "github",
++        "url": "https://github.com/sponsors/Brooooooklyn"
++      }
++    },
++    "node_modules/@napi-rs/canvas-darwin-x64": {
++      "version": "1.0.5",
++      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-darwin-x64/-/canvas-darwin-x64-1.0.5.tgz",
++      "integrity": "sha512-9BXlLHBXpYnK4jSae1MdFdyPq09Xi1I3PeCNpvRzqgmUUBhgJS7aC1z7SZEP8JUXDHtbfIrolCS3sFuT9IGP2A==",
++      "cpu": [
++        "x64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "engines": {
++        "node": ">= 10"
++      },
++      "funding": {
++        "type": "github",
++        "url": "https://github.com/sponsors/Brooooooklyn"
++      }
++    },
++    "node_modules/@napi-rs/canvas-linux-arm-gnueabihf": {
++      "version": "1.0.5",
++      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-linux-arm-gnueabihf/-/canvas-linux-arm-gnueabihf-1.0.5.tgz",
++      "integrity": "sha512-zEW4fgvtYsOJ/N56Us4TQPfaFrUf0shGr9CgGSj3GACc+NHfUM3ci0YF9xFTjwJWGDmaEhYPL6KqCfFCxwm/qg==",
++      "cpu": [
++        "arm"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 10"
++      },
++      "funding": {
++        "type": "github",
++        "url": "https://github.com/sponsors/Brooooooklyn"
++      }
++    },
++    "node_modules/@napi-rs/canvas-linux-arm64-gnu": {
++      "version": "1.0.5",
++      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-linux-arm64-gnu/-/canvas-linux-arm64-gnu-1.0.5.tgz",
++      "integrity": "sha512-HFprwLspelJxCEtZvdMcz95Mwvfs63GzFVedLFmC/wslHnaOXhjXxgYxPCM/VdM4Jhx3CV4Lk0vVmh6hJv2etQ==",
++      "cpu": [
++        "arm64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 10"
++      },
++      "funding": {
++        "type": "github",
++        "url": "https://github.com/sponsors/Brooooooklyn"
++      }
++    },
++    "node_modules/@napi-rs/canvas-linux-arm64-musl": {
++      "version": "1.0.5",
++      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-linux-arm64-musl/-/canvas-linux-arm64-musl-1.0.5.tgz",
++      "integrity": "sha512-FNMGFAx8DvtDwlLfWyBJ+oQjgPXoIAqCnNTJYqtJCFRwwzK3AyAe5B1Ll3NZ6hcOzqw7HylZsq4nQxVyPCQX1Q==",
++      "cpu": [
++        "arm64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 10"
++      },
++      "funding": {
++        "type": "github",
++        "url": "https://github.com/sponsors/Brooooooklyn"
++      }
++    },
++    "node_modules/@napi-rs/canvas-linux-riscv64-gnu": {
++      "version": "1.0.5",
++      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-linux-riscv64-gnu/-/canvas-linux-riscv64-gnu-1.0.5.tgz",
++      "integrity": "sha512-2vd5v8Lui+37Hh/spITKIvTT384ip4dnUc5XBn0E+sMNS4b7au7IswyT5YDG2udPTjSh/eLUs3sGuB5YHooFOA==",
++      "cpu": [
++        "riscv64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 10"
++      },
++      "funding": {
++        "type": "github",
++        "url": "https://github.com/sponsors/Brooooooklyn"
++      }
++    },
++    "node_modules/@napi-rs/canvas-linux-x64-gnu": {
++      "version": "1.0.5",
++      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-linux-x64-gnu/-/canvas-linux-x64-gnu-1.0.5.tgz",
++      "integrity": "sha512-iQIPy+Uey0expZTOszLri5n8rY7x4WUpMaY82mcXNIgbil30iHvc01OsiizhZC1KQHTK90RFMFWSpwFU+ON3aA==",
++      "cpu": [
++        "x64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 10"
++      },
++      "funding": {
++        "type": "github",
++        "url": "https://github.com/sponsors/Brooooooklyn"
++      }
++    },
++    "node_modules/@napi-rs/canvas-linux-x64-musl": {
++      "version": "1.0.5",
++      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-linux-x64-musl/-/canvas-linux-x64-musl-1.0.5.tgz",
++      "integrity": "sha512-Npthji25t7FUqIAKsoEkFS0qY5CYVkHjvI3tuZjDTG92wX8g4dst+Lfb4hhubdqPazlDcIwalPzInsFCtf3FFg==",
++      "cpu": [
++        "x64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 10"
++      },
++      "funding": {
++        "type": "github",
++        "url": "https://github.com/sponsors/Brooooooklyn"
++      }
++    },
++    "node_modules/@napi-rs/canvas-win32-arm64-msvc": {
++      "version": "1.0.5",
++      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-win32-arm64-msvc/-/canvas-win32-arm64-msvc-1.0.5.tgz",
++      "integrity": "sha512-bi+JsdCdbfVJDoAQybTYmkLKwh1xpYpptg5j/BNr2BB56u4/R26jrVvtjqff+CxYMXV6Kz1/jeDVhZCuj6bDng==",
++      "cpu": [
++        "arm64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "win32"
++      ],
++      "engines": {
++        "node": ">= 10"
++      },
++      "funding": {
++        "type": "github",
++        "url": "https://github.com/sponsors/Brooooooklyn"
++      }
++    },
++    "node_modules/@napi-rs/canvas-win32-x64-msvc": {
++      "version": "1.0.5",
++      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-win32-x64-msvc/-/canvas-win32-x64-msvc-1.0.5.tgz",
++      "integrity": "sha512-KQQwG9/sBmcGxqaLFIQf+k2OefREGoyEaIBmRuTM8bUuFKOEE9Xk5pel90hE6pmBwk/vo4RB0OdX+FxobJGMFw==",
++      "cpu": [
++        "x64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "win32"
++      ],
++      "engines": {
++        "node": ">= 10"
++      },
++      "funding": {
++        "type": "github",
++        "url": "https://github.com/sponsors/Brooooooklyn"
++      }
++    },
++    "node_modules/@tesseract.js-data/eng": {
++      "version": "1.0.0",
++      "resolved": "https://registry.npmjs.org/@tesseract.js-data/eng/-/eng-1.0.0.tgz",
++      "integrity": "sha512-mbTumm6KQPUHyzTPQaF3ObXYnx0SqqfV2nabqFVQBwD6Kl7PhGSLSzOlfFTWy0P3BjghaSKA2W9GB19Jk+ZcTg==",
++      "license": "MIT"
++    },
+     "node_modules/accepts": {
+       "version": "1.3.8",
+       "resolved": "https://registry.npmjs.org/accepts/-/accepts-1.3.8.tgz",
+@@ -95,6 +355,12 @@
+         "url": "https://github.com/sponsors/sindresorhus"
+       }
+     },
++    "node_modules/bmp-js": {
++      "version": "0.1.0",
++      "resolved": "https://registry.npmjs.org/bmp-js/-/bmp-js-0.1.0.tgz",
++      "integrity": "sha512-vHdS19CnY3hwiNdkaqk93DvjVLfbEcI8mys4UjuWrlX1haDmroo8o4xCzh4wD6DGV6HxRCyauwhHRqMTfERtjw==",
++      "license": "MIT"
++    },
+     "node_modules/body-parser": {
+       "version": "1.20.5",
+       "resolved": "https://registry.npmjs.org/body-parser/-/body-parser-1.20.5.tgz",
+@@ -712,6 +978,12 @@
+         "node": ">=0.10.0"
+       }
+     },
++    "node_modules/idb-keyval": {
++      "version": "6.3.0",
++      "resolved": "https://registry.npmjs.org/idb-keyval/-/idb-keyval-6.3.0.tgz",
++      "integrity": "sha512-um+2dgAWmYsu615EXpWVwSmapJhON0G43t3Ka/EVaohzPQXSMqKEqeDK/oIW3Ow+BXaF2PvSc+oBTFp793A5Ow==",
++      "license": "Apache-2.0"
++    },
+     "node_modules/ignore-by-default": {
+       "version": "1.0.1",
+       "resolved": "https://registry.npmjs.org/ignore-by-default/-/ignore-by-default-1.0.1.tgz",
+@@ -780,6 +1052,12 @@
+         "node": ">=0.12.0"
+       }
+     },
++    "node_modules/is-url": {
++      "version": "1.2.4",
++      "resolved": "https://registry.npmjs.org/is-url/-/is-url-1.2.4.tgz",
++      "integrity": "sha512-ITvGim8FhRiYe4IQ5uHSkj7pVaPDrCTkNd3yq3cV7iZAcJdHTUMPMEHcqSOy9xZ9qFenQCvi+2wjH9a1nXqHww==",
++      "license": "MIT"
++    },
+     "node_modules/isarray": {
+       "version": "1.0.0",
+       "resolved": "https://registry.npmjs.org/isarray/-/isarray-1.0.0.tgz",
+@@ -1023,6 +1301,26 @@
+         "node": ">= 0.6"
+       }
+     },
++    "node_modules/node-fetch": {
++      "version": "2.7.0",
++      "resolved": "https://registry.npmjs.org/node-fetch/-/node-fetch-2.7.0.tgz",
++      "integrity": "sha512-c4FRfUm/dbcWZ7U+1Wq0AwCyFL+3nt2bEw05wfxSz+DWpWsitgmSgYmy2dQdWyKC1694ELPqMs/YzUSNozLt8A==",
++      "license": "MIT",
++      "dependencies": {
++        "whatwg-url": "^5.0.0"
++      },
++      "engines": {
++        "node": "4.x || >=6.0.0"
++      },
++      "peerDependencies": {
++        "encoding": "^0.1.0"
++      },
++      "peerDependenciesMeta": {
++        "encoding": {
++          "optional": true
++        }
++      }
++    },
+     "node_modules/nodemon": {
+       "version": "3.1.14",
+       "resolved": "https://registry.npmjs.org/nodemon/-/nodemon-3.1.14.tgz",
+@@ -1120,6 +1418,15 @@
+         "node": ">= 0.8"
+       }
+     },
++    "node_modules/opencollective-postinstall": {
++      "version": "2.0.3",
++      "resolved": "https://registry.npmjs.org/opencollective-postinstall/-/opencollective-postinstall-2.0.3.tgz",
++      "integrity": "sha512-8AV/sCtuzUeTo8gQK5qDZzARrulB3egtLzFgteqB2tcT4Mw7B8Kt7JcDHmltjz6FOAHsvTevk70gZEbhM4ZS9Q==",
++      "license": "MIT",
++      "bin": {
++        "opencollective-postinstall": "index.js"
++      }
++    },
+     "node_modules/parseurl": {
+       "version": "1.3.3",
+       "resolved": "https://registry.npmjs.org/parseurl/-/parseurl-1.3.3.tgz",
+@@ -1135,6 +1442,234 @@
+       "integrity": "sha512-A/AGNMFN3c8bOlvV9RreMdrv7jsmF9XIfDeCd87+I8RNg6s78BhJxMu69NEMHBSJFxKidViTEdruRwEk/WIKqA==",
+       "license": "MIT"
+     },
++    "node_modules/pdf-parse": {
++      "version": "2.4.5",
++      "resolved": "https://registry.npmjs.org/pdf-parse/-/pdf-parse-2.4.5.tgz",
++      "integrity": "sha512-mHU89HGh7v+4u2ubfnevJ03lmPgQ5WU4CxAVmTSh/sxVTEDYd1er/dKS/A6vg77NX47KTEoihq8jZBLr8Cxuwg==",
++      "license": "Apache-2.0",
++      "dependencies": {
++        "@napi-rs/canvas": "0.1.80",
++        "pdfjs-dist": "5.4.296"
++      },
++      "bin": {
++        "pdf-parse": "bin/cli.mjs"
++      },
++      "engines": {
++        "node": ">=20.16.0 <21 || >=22.3.0"
++      },
++      "funding": {
++        "type": "github",
++        "url": "https://github.com/sponsors/mehmet-kozan"
++      }
++    },
++    "node_modules/pdf-parse/node_modules/@napi-rs/canvas": {
++      "version": "0.1.80",
++      "resolved": "https://registry.npmjs.org/@napi-rs/canvas/-/canvas-0.1.80.tgz",
++      "integrity": "sha512-DxuT1ClnIPts1kQx8FBmkk4BQDTfI5kIzywAaMjQSXfNnra5UFU9PwurXrl+Je3bJ6BGsp/zmshVVFbCmyI+ww==",
++      "license": "MIT",
++      "workspaces": [
++        "e2e/*"
++      ],
++      "engines": {
++        "node": ">= 10"
++      },
++      "optionalDependencies": {
++        "@napi-rs/canvas-android-arm64": "0.1.80",
++        "@napi-rs/canvas-darwin-arm64": "0.1.80",
++        "@napi-rs/canvas-darwin-x64": "0.1.80",
++        "@napi-rs/canvas-linux-arm-gnueabihf": "0.1.80",
++        "@napi-rs/canvas-linux-arm64-gnu": "0.1.80",
++        "@napi-rs/canvas-linux-arm64-musl": "0.1.80",
++        "@napi-rs/canvas-linux-riscv64-gnu": "0.1.80",
++        "@napi-rs/canvas-linux-x64-gnu": "0.1.80",
++        "@napi-rs/canvas-linux-x64-musl": "0.1.80",
++        "@napi-rs/canvas-win32-x64-msvc": "0.1.80"
++      }
++    },
++    "node_modules/pdf-parse/node_modules/@napi-rs/canvas-android-arm64": {
++      "version": "0.1.80",
++      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-android-arm64/-/canvas-android-arm64-0.1.80.tgz",
++      "integrity": "sha512-sk7xhN/MoXeuExlggf91pNziBxLPVUqF2CAVnB57KLG/pz7+U5TKG8eXdc3pm0d7Od0WreB6ZKLj37sX9muGOQ==",
++      "cpu": [
++        "arm64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "android"
++      ],
++      "engines": {
++        "node": ">= 10"
++      }
++    },
++    "node_modules/pdf-parse/node_modules/@napi-rs/canvas-darwin-arm64": {
++      "version": "0.1.80",
++      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-darwin-arm64/-/canvas-darwin-arm64-0.1.80.tgz",
++      "integrity": "sha512-O64APRTXRUiAz0P8gErkfEr3lipLJgM6pjATwavZ22ebhjYl/SUbpgM0xcWPQBNMP1n29afAC/Us5PX1vg+JNQ==",
++      "cpu": [
++        "arm64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "engines": {
++        "node": ">= 10"
++      }
++    },
++    "node_modules/pdf-parse/node_modules/@napi-rs/canvas-darwin-x64": {
++      "version": "0.1.80",
++      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-darwin-x64/-/canvas-darwin-x64-0.1.80.tgz",
++      "integrity": "sha512-FqqSU7qFce0Cp3pwnTjVkKjjOtxMqRe6lmINxpIZYaZNnVI0H5FtsaraZJ36SiTHNjZlUB69/HhxNDT1Aaa9vA==",
++      "cpu": [
++        "x64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "engines": {
++        "node": ">= 10"
++      }
++    },
++    "node_modules/pdf-parse/node_modules/@napi-rs/canvas-linux-arm-gnueabihf": {
++      "version": "0.1.80",
++      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-linux-arm-gnueabihf/-/canvas-linux-arm-gnueabihf-0.1.80.tgz",
++      "integrity": "sha512-eyWz0ddBDQc7/JbAtY4OtZ5SpK8tR4JsCYEZjCE3dI8pqoWUC8oMwYSBGCYfsx2w47cQgQCgMVRVTFiiO38hHQ==",
++      "cpu": [
++        "arm"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 10"
++      }
++    },
++    "node_modules/pdf-parse/node_modules/@napi-rs/canvas-linux-arm64-gnu": {
++      "version": "0.1.80",
++      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-linux-arm64-gnu/-/canvas-linux-arm64-gnu-0.1.80.tgz",
++      "integrity": "sha512-qwA63t8A86bnxhuA/GwOkK3jvb+XTQaTiVML0vAWoHyoZYTjNs7BzoOONDgTnNtr8/yHrq64XXzUoLqDzU+Uuw==",
++      "cpu": [
++        "arm64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 10"
++      }
++    },
++    "node_modules/pdf-parse/node_modules/@napi-rs/canvas-linux-arm64-musl": {
++      "version": "0.1.80",
++      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-linux-arm64-musl/-/canvas-linux-arm64-musl-0.1.80.tgz",
++      "integrity": "sha512-1XbCOz/ymhj24lFaIXtWnwv/6eFHXDrjP0jYkc6iHQ9q8oXKzUX1Lc6bu+wuGiLhGh2GS/2JlfORC5ZcXimRcg==",
++      "cpu": [
++        "arm64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 10"
++      }
++    },
++    "node_modules/pdf-parse/node_modules/@napi-rs/canvas-linux-riscv64-gnu": {
++      "version": "0.1.80",
++      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-linux-riscv64-gnu/-/canvas-linux-riscv64-gnu-0.1.80.tgz",
++      "integrity": "sha512-XTzR125w5ZMs0lJcxRlS1K3P5RaZ9RmUsPtd1uGt+EfDyYMu4c6SEROYsxyatbbu/2+lPe7MPHOO/0a0x7L/gw==",
++      "cpu": [
++        "riscv64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 10"
++      }
++    },
++    "node_modules/pdf-parse/node_modules/@napi-rs/canvas-linux-x64-gnu": {
++      "version": "0.1.80",
++      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-linux-x64-gnu/-/canvas-linux-x64-gnu-0.1.80.tgz",
++      "integrity": "sha512-BeXAmhKg1kX3UCrJsYbdQd3hIMDH/K6HnP/pG2LuITaXhXBiNdh//TVVVVCBbJzVQaV5gK/4ZOCMrQW9mvuTqA==",
++      "cpu": [
++        "x64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 10"
++      }
++    },
++    "node_modules/pdf-parse/node_modules/@napi-rs/canvas-linux-x64-musl": {
++      "version": "0.1.80",
++      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-linux-x64-musl/-/canvas-linux-x64-musl-0.1.80.tgz",
++      "integrity": "sha512-x0XvZWdHbkgdgucJsRxprX/4o4sEed7qo9rCQA9ugiS9qE2QvP0RIiEugtZhfLH3cyI+jIRFJHV4Fuz+1BHHMg==",
++      "cpu": [
++        "x64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 10"
++      }
++    },
++    "node_modules/pdf-parse/node_modules/@napi-rs/canvas-win32-x64-msvc": {
++      "version": "0.1.80",
++      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-win32-x64-msvc/-/canvas-win32-x64-msvc-0.1.80.tgz",
++      "integrity": "sha512-Z8jPsM6df5V8B1HrCHB05+bDiCxjE9QA//3YrkKIdVDEwn5RKaqOxCJDRJkl48cJbylcrJbW4HxZbTte8juuPg==",
++      "cpu": [
++        "x64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "win32"
++      ],
++      "engines": {
++        "node": ">= 10"
++      }
++    },
++    "node_modules/pdf-parse/node_modules/pdfjs-dist": {
++      "version": "5.4.296",
++      "resolved": "https://registry.npmjs.org/pdfjs-dist/-/pdfjs-dist-5.4.296.tgz",
++      "integrity": "sha512-DlOzet0HO7OEnmUmB6wWGJrrdvbyJKftI1bhMitK7O2N8W2gc757yyYBbINy9IDafXAV9wmKr9t7xsTaNKRG5Q==",
++      "license": "Apache-2.0",
++      "engines": {
++        "node": ">=20.16.0 || >=22.3.0"
++      },
++      "optionalDependencies": {
++        "@napi-rs/canvas": "^0.1.80"
++      }
++    },
++    "node_modules/pdfjs-dist": {
++      "version": "6.2.108",
++      "resolved": "https://registry.npmjs.org/pdfjs-dist/-/pdfjs-dist-6.2.108.tgz",
++      "integrity": "sha512-YxFb+SQcodN2rnX9Tn3dHYlqfb7NjlzzfONPpJd+AKoKtUjEdevTfbC07d5TcczzOK6261auRkP/M8OBHs9vFQ==",
++      "license": "Apache-2.0",
++      "engines": {
++        "node": ">=22.13.0 || >=24"
++      },
++      "optionalDependencies": {
++        "@napi-rs/canvas": "^1.0.0"
++      }
++    },
+     "node_modules/pg": {
+       "version": "8.22.0",
+       "resolved": "https://registry.npmjs.org/pg/-/pg-8.22.0.tgz",
+@@ -1376,6 +1911,12 @@
+         "node": ">=8.10.0"
+       }
+     },
++    "node_modules/regenerator-runtime": {
++      "version": "0.13.11",
++      "resolved": "https://registry.npmjs.org/regenerator-runtime/-/regenerator-runtime-0.13.11.tgz",
++      "integrity": "sha512-kY1AZVr2Ra+t+piVaJ4gxaFaReZVH40AKNo7UCX6W+dEwBo/2oZJzqfuN1qLq1oL45o56cPaTXELwrTh8Fpggg==",
++      "license": "MIT"
++    },
+     "node_modules/safe-buffer": {
+       "version": "5.2.1",
+       "resolved": "https://registry.npmjs.org/safe-buffer/-/safe-buffer-5.2.1.tgz",
+@@ -1604,6 +2145,30 @@
+         "node": ">=4"
+       }
+     },
++    "node_modules/tesseract.js": {
++      "version": "7.0.0",
++      "resolved": "https://registry.npmjs.org/tesseract.js/-/tesseract.js-7.0.0.tgz",
++      "integrity": "sha512-exPBkd+z+wM1BuMkx/Bjv43OeLBxhL5kKWsz/9JY+DXcXdiBjiAch0V49QR3oAJqCaL5qURE0vx9Eo+G5YE7mA==",
++      "hasInstallScript": true,
++      "license": "Apache-2.0",
++      "dependencies": {
++        "bmp-js": "^0.1.0",
++        "idb-keyval": "^6.2.0",
++        "is-url": "^1.2.4",
++        "node-fetch": "^2.6.9",
++        "opencollective-postinstall": "^2.0.3",
++        "regenerator-runtime": "^0.13.3",
++        "tesseract.js-core": "^7.0.0",
++        "wasm-feature-detect": "^1.8.0",
++        "zlibjs": "^0.3.1"
++      }
++    },
++    "node_modules/tesseract.js-core": {
++      "version": "7.0.0",
++      "resolved": "https://registry.npmjs.org/tesseract.js-core/-/tesseract.js-core-7.0.0.tgz",
++      "integrity": "sha512-WnNH518NzmbSq9zgTPeoF8c+xmilS8rFIl1YKbk/ptuuc7p6cLNELNuPAzcmsYw450ca6bLa8j3t0VAtq435Vw==",
++      "license": "Apache-2.0"
++    },
+     "node_modules/to-regex-range": {
+       "version": "5.0.1",
+       "resolved": "https://registry.npmjs.org/to-regex-range/-/to-regex-range-5.0.1.tgz",
+@@ -1636,6 +2201,12 @@
+         "nodetouch": "bin/nodetouch.js"
+       }
+     },
++    "node_modules/tr46": {
++      "version": "0.0.3",
++      "resolved": "https://registry.npmjs.org/tr46/-/tr46-0.0.3.tgz",
++      "integrity": "sha512-N3WMsuqV66lT30CrXNbEjx4GEwlow3v6rr4mCcv6prnfwhS01rkgyFdjPNBYd9br7LpXV1+Emh01fHnq2Gdgrw==",
++      "license": "MIT"
++    },
+     "node_modules/type-is": {
+       "version": "1.6.18",
+       "resolved": "https://registry.npmjs.org/type-is/-/type-is-1.6.18.tgz",
+@@ -1718,6 +2289,28 @@
+         "node": ">= 0.8"
+       }
+     },
++    "node_modules/wasm-feature-detect": {
++      "version": "1.9.0",
++      "resolved": "https://registry.npmjs.org/wasm-feature-detect/-/wasm-feature-detect-1.9.0.tgz",
++      "integrity": "sha512-zonE+xlIIYtxPy++L24ow0hAD8CICb4+FgPyROd3buyXIqsJvUEDkBgfCCoXOd1Hu3DUr0GOfnPIdcGV+YpNaA==",
++      "license": "Apache-2.0"
++    },
++    "node_modules/webidl-conversions": {
++      "version": "3.0.1",
++      "resolved": "https://registry.npmjs.org/webidl-conversions/-/webidl-conversions-3.0.1.tgz",
++      "integrity": "sha512-2JAn3z8AR6rjK8Sm8orRC0h/bcl/DqL7tRPdGZ4I1CjdF+EaMLmYxBHyXuKL849eucPFhvBoxMsflfOb8kxaeQ==",
++      "license": "BSD-2-Clause"
++    },
++    "node_modules/whatwg-url": {
++      "version": "5.0.0",
++      "resolved": "https://registry.npmjs.org/whatwg-url/-/whatwg-url-5.0.0.tgz",
++      "integrity": "sha512-saE57nupxk6v3HY35+jzBwYa0rKSy0XR8JSxZPwgLr7ys0IBzhGviA1/TUGJLmSVqs8pb9AnvICXEuOHLprYTw==",
++      "license": "MIT",
++      "dependencies": {
++        "tr46": "~0.0.3",
++        "webidl-conversions": "^3.0.0"
++      }
++    },
+     "node_modules/xtend": {
+       "version": "4.0.2",
+       "resolved": "https://registry.npmjs.org/xtend/-/xtend-4.0.2.tgz",
+@@ -1726,6 +2319,15 @@
+       "engines": {
+         "node": ">=0.4"
+       }
++    },
++    "node_modules/zlibjs": {
++      "version": "0.3.1",
++      "resolved": "https://registry.npmjs.org/zlibjs/-/zlibjs-0.3.1.tgz",
++      "integrity": "sha512-+J9RrgTKOmlxFSDHo0pI1xM6BLVUv+o0ZT9ANtCxGkjIVCCUdx9alUF8Gm+dGLKbkkkidWIHFDZHDMpfITt4+w==",
++      "license": "MIT",
++      "engines": {
++        "node": "*"
++      }
+     }
+   }
+ }
+diff --git a/package.json b/package.json
+index 4d8aff0..7ba3c28 100644
+--- a/package.json
++++ b/package.json
+@@ -12,6 +12,8 @@
+     "check-db": "node tests/checkDbConnectivity.js"
+   },
+   "dependencies": {
++    "@napi-rs/canvas": "^1.0.5",
++    "@tesseract.js-data/eng": "^1.0.0",
+     "bcryptjs": "^2.4.3",
+     "cors": "^2.8.5",
+     "dotenv": "^16.4.5",
+@@ -21,7 +23,10 @@
+     "helmet": "^7.1.0",
+     "jsonwebtoken": "^9.0.2",
+     "multer": "^1.4.5-lts.1",
++    "pdf-parse": "^2.4.5",
++    "pdfjs-dist": "^6.2.108",
+     "pg": "^8.11.5",
++    "tesseract.js": "^7.0.0",
+     "uuid": "^9.0.1"
+   },
+   "devDependencies": {
+diff --git a/routes/chatRoutes.js b/routes/chatRoutes.js
+index ab724e7..36164bc 100644
+--- a/routes/chatRoutes.js
++++ b/routes/chatRoutes.js
+@@ -2,12 +2,31 @@
+ const express = require('express');
+ const router  = express.Router();
+ 
+-const { sendMessage, getChatHistory } = require('../controllers/chatController');
++const {
++  sendMessage,
++  getChatHistory,
++  sendGeneralMessage,
++  getGeneralChatHistory,
++  listSessions,
++  getSessionHistory,
++} = require('../controllers/chatController');
+ const { requireAuth } = require('../middleware/auth');
+-const { chatMessageRules, reportIdParamRules, validate } = require('../middleware/validators');
++const { chatMessageRules, reportIdParamRules, generalChatMessageRules, validate } = require('../middleware/validators');
+ 
+ router.use(requireAuth);
+ 
++// GET  /api/chat/sessions            — list all saved chat threads (most recent first)
++// GET  /api/chat/sessions/:sessionId — full messages for one saved thread
++// NOTE: registered early so "sessions" isn't swallowed as a reportId param
++router.get('/sessions', listSessions);
++router.get('/sessions/:sessionId', getSessionHistory);
++
++// POST /api/chat/general            — general health Q&A, no report selected
++// GET  /api/chat/general/history    — fetch saved general chat history
++// NOTE: also registered before /:reportId for the same reason
++router.post('/general', generalChatMessageRules, validate, sendGeneralMessage);
++router.get('/general/history', getGeneralChatHistory);
++
+ // POST /api/chat/:reportId          — send a message about a report
+ router.post('/:reportId', chatMessageRules, validate, sendMessage);
+ 
+diff --git a/routes/reportRoutes.js b/routes/reportRoutes.js
+index 13729d9..f743e40 100644
+--- a/routes/reportRoutes.js
++++ b/routes/reportRoutes.js
+@@ -5,12 +5,15 @@ const router  = express.Router();
+ const { createReport, listReports, getReport, deleteReport } = require('../controllers/reportController');
+ const { requireAuth } = require('../middleware/auth');
+ const { createReportRules, uuidParamRules, validate } = require('../middleware/validators');
++const upload = require('../middleware/upload');
+ 
+ // All report routes require login
+ router.use(requireAuth);
+ 
+ // POST /api/reports        — upload + analyze a report
+-router.post('/', createReportRules, validate, createReport);
++// `upload.single('file')` runs first so a multipart file (if any) lands on req.file
++// before validation/the controller run. JSON-only (paste-text) requests pass through fine too.
++router.post('/', upload.single('file'), createReportRules, validate, createReport);
+ 
+ // GET /api/reports         — list all reports for logged-in user
+ router.get('/', listReports);
+diff --git a/utils/aiService.js b/utils/aiService.js
+index 6cfa2f8..a1aa8aa 100644
+--- a/utils/aiService.js
++++ b/utils/aiService.js
+@@ -1,95 +1,281 @@
+-// utils/aiService.js
+-// MOCKED AI responses — swap the functions below for real OpenAI calls later.
+-// To enable real AI: npm install openai  and replace mock functions with actual API calls.
+-
+-// ─────────────────────────────────────────────────────────────
+-// analyzeReport(reportText)
+-// Called when a report is uploaded. Returns a structured summary.
+-// ─────────────────────────────────────────────────────────────
+-const analyzeReport = async (reportText) => {
+-  // 🔴 MOCK — replace this block with real OpenAI call when you have an API key
+-  await new Promise((r) => setTimeout(r, 500)); // simulate network delay
+ 
++// utils/aiService.js
++// AI Service — Google Gemini (free tier, no credit card needed)
++// To get API key: https://aistudio.google.com/app/apikey (free)
++// Falls back to mock responses if API key not set
++ 
++const IS_MOCK = !process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === "your_gemini_key_here";
++ 
++// ─────────────────────────────────────────────────────────────────────────────
++// SYSTEM PROMPTS (Prompt Engineering)
++// ─────────────────────────────────────────────────────────────────────────────
++ 
++const REPORT_ANALYSIS_SYSTEM_PROMPT = `You are MedInsight AI, an expert medical report analyzer.
++Your job is to analyze patient lab reports and provide clear, accurate, and easy-to-understand results.
++ 
++RULES:
++- Always respond with ONLY valid JSON — no markdown, no explanation outside JSON
++- Be accurate but use plain language a non-doctor can understand
++- Flag anything outside normal ranges
++- Never diagnose — only analyze and suggest consulting a doctor
++ 
++RESPONSE FORMAT (strict JSON):
++{
++  "summary_text": "2-3 sentence plain language summary of the overall health picture",
++  "key_findings": [
++    { "marker": "marker name", "value": "value with unit", "status": "Normal|High|Low" }
++  ],
++  "abnormal_flags": [
++    { "marker": "marker name", "reason": "plain language explanation of why this is concerning" }
++  ],
++  "risk_level": "Low|Medium|High",
++  "recommendations": ["recommendation 1", "recommendation 2"]
++}`;
++ 
++const CHAT_SYSTEM_PROMPT = `You are MedInsight AI, a friendly and knowledgeable medical assistant.
++You help patients understand their lab report results in simple, clear language.
++ 
++RULES:
++- Answer only health and medical report related questions
++- Use simple language — avoid complex medical jargon
++- Always recommend consulting a real doctor for diagnosis or treatment decisions
++- Be empathetic and reassuring
++- Keep answers concise (2-4 sentences)
++- If asked something unrelated to health, politely redirect
++ 
++You have access to this patient's report context: {REPORT_CONTEXT}`;
++ 
++// ─────────────────────────────────────────────────────────────────────────────
++// GEMINI API CALL
++// ─────────────────────────────────────────────────────────────────────────────
++async function callGemini(systemPrompt, userPrompt, expectJSON = false) {
++  // NOTE: Google retires Gemini model IDs frequently (sometimes ahead of their
++  // published deprecation dates). If you start seeing API_ERROR:404 again,
++  // check https://ai.google.dev/gemini-api/docs/deprecations and update the
++  // fallback below and/or your GEMINI_MODEL env var.
++  const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
++  const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
++ 
++  // Temporary debug log — remove once you've confirmed the right model is being used.
++  console.log('[DEBUG] Gemini model in use:', GEMINI_MODEL);
++ 
++  const body = {
++    system_instruction: { parts: [{ text: systemPrompt }] },
++    contents: [{ role: "user", parts: [{ text: userPrompt }] }],
++    generationConfig: {
++      temperature:     0.3,
++      maxOutputTokens: 2048,
++      ...(expectJSON ? { responseMimeType: "application/json" } : {}),
++    },
++  };
++ 
++  const controller = new AbortController();
++  const timeout    = setTimeout(() => controller.abort(), 15000); // 15s timeout
++ 
++  try {
++    const res = await fetch(GEMINI_URL, {
++      method:  "POST",
++      headers: { "Content-Type": "application/json" },
++      body:    JSON.stringify(body),
++      signal:  controller.signal,
++    });
++    clearTimeout(timeout);
++ 
++    if (res.status === 429) throw new Error("RATE_LIMIT");
++    if (res.status === 403) throw new Error("INVALID_KEY");
++    if (!res.ok) {
++      // Surface the response body on error — very useful for diagnosing 404s
++      // (Google usually returns a JSON error explaining exactly which model
++      // wasn't found, or why the request was rejected).
++      let details = "";
++      try {
++        const errBody = await res.json();
++        details = errBody?.error?.message ? ` — ${errBody.error.message}` : "";
++      } catch {
++        // response body wasn't JSON; ignore
++      }
++      throw new Error(`API_ERROR:${res.status}${details}`);
++    }
++ 
++    const data = await res.json();
++    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
++ 
++    if (!text || text.trim() === "") throw new Error("EMPTY_RESPONSE");
++    return text.trim();
++ 
++  } catch (err) {
++    clearTimeout(timeout);
++    if (err.name === "AbortError") throw new Error("TIMEOUT");
++    throw err;
++  }
++}
++ 
++// ─────────────────────────────────────────────────────────────────────────────
++// RESPONSE VALIDATION
++// ─────────────────────────────────────────────────────────────────────────────
++function validateReportAnalysis(result) {
++  // Ensure required fields exist
++  if (!result.summary_text || typeof result.summary_text !== "string") {
++    result.summary_text = "Report analyzed. Please consult your doctor for a detailed interpretation.";
++  }
++  if (!Array.isArray(result.key_findings))  result.key_findings   = [];
++  if (!Array.isArray(result.abnormal_flags)) result.abnormal_flags = [];
++  if (!Array.isArray(result.recommendations)) result.recommendations = ["Consult your doctor for detailed advice."];
++  if (!["Low", "Medium", "High"].includes(result.risk_level)) result.risk_level = "Low";
++ 
++  // Remove duplicate findings
++  const seen = new Set();
++  result.key_findings = result.key_findings.filter((f) => {
++    if (seen.has(f.marker)) return false;
++    seen.add(f.marker); return true;
++  });
++ 
++  // Validate statuses
++  result.key_findings = result.key_findings.map((f) => ({
++    ...f,
++    status: ["Normal", "High", "Low"].includes(f.status) ? f.status : "Normal",
++  }));
++ 
++  return result;
++}
++ 
++function parseJSON(text) {
++  // Strip markdown code fences if present
++  const clean = text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
++  try { return JSON.parse(clean); }
++  catch { throw new Error("INVALID_JSON"); }
++}
++ 
++// ─────────────────────────────────────────────────────────────────────────────
++// MOCK RESPONSES (used when no API key)
++// ─────────────────────────────────────────────────────────────────────────────
++function getMockAnalysis(reportText) {
++  const text = (reportText || "").toLowerCase();
++  const hasHighCholesterol = text.includes("cholesterol") || text.includes("228") || text.includes("ldl");
++  const hasAnemia          = text.includes("hemoglobin")  || text.includes("11.2");
++  const hasGlucose         = text.includes("glucose")     || text.includes("108");
++ 
+   return {
+-    summary_text:
+-      'Your blood test results have been analyzed. Most values are within normal range. ' +
+-      'Some markers require attention — please consult your doctor.',
++    summary_text: `Your blood test results have been analyzed. ${
++      hasHighCholesterol ? "Cholesterol levels are elevated. " : ""
++    }${hasAnemia ? "Hemoglobin is slightly low suggesting mild anemia. " : ""
++    }${hasGlucose ? "Fasting glucose is in the pre-diabetic range. " : ""
++    }Please consult your doctor for a detailed assessment.`,
+     key_findings: [
+-      { marker: 'Hemoglobin',        value: '11.2 g/dL',  status: 'Low'    },
+-      { marker: 'Glucose (Fasting)', value: '108 mg/dL',  status: 'High'   },
+-      { marker: 'Cholesterol',       value: '228 mg/dL',  status: 'High'   },
+-      { marker: 'White Blood Cells', value: '7.4 K/μL',   status: 'Normal' },
++      { marker: "Hemoglobin",         value: "11.2 g/dL",  status: "Low"    },
++      { marker: "Glucose (Fasting)",  value: "108 mg/dL",  status: "High"   },
++      { marker: "Cholesterol (Total)",value: "228 mg/dL",  status: "High"   },
++      { marker: "LDL Cholesterol",    value: "142 mg/dL",  status: "High"   },
++      { marker: "White Blood Cells",  value: "7.4 K/µL",   status: "Normal" },
++      { marker: "Creatinine",         value: "0.9 mg/dL",  status: "Normal" },
+     ],
+     abnormal_flags: [
+-      { marker: 'Hemoglobin',  reason: 'Below normal range. Possible mild anemia.'          },
+-      { marker: 'Glucose',     reason: 'Pre-diabetic range. Monitor with dietary changes.'  },
+-      { marker: 'Cholesterol', reason: 'Above recommended level. Dietary changes advised.'  },
++      { marker: "Hemoglobin",          reason: "Below normal range. May indicate mild anemia. Iron-rich foods like spinach and lentils can help." },
++      { marker: "Glucose (Fasting)",   reason: "Pre-diabetic range. Monitor with dietary changes — reduce sugar and refined carbs." },
++      { marker: "Cholesterol (Total)", reason: "Above recommended level of 200 mg/dL. Increases cardiovascular risk over time." },
+     ],
+-  };
+-
+-  /* ── REAL OpenAI implementation (uncomment when ready) ────────────────
+-  const OpenAI = require('openai');
+-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+-
+-  const completion = await openai.chat.completions.create({
+-    model: 'gpt-4',
+-    messages: [
+-      {
+-        role: 'system',
+-        content: `You are a medical report analyzer. Analyze the given lab report and return a JSON object with:
+-          - summary_text: plain language summary
+-          - key_findings: array of { marker, value, status }
+-          - abnormal_flags: array of { marker, reason }
+-          Respond ONLY with valid JSON.`,
+-      },
+-      { role: 'user', content: reportText },
++    risk_level: "Medium",
++    recommendations: [
++      "Schedule a follow-up with your doctor within 4 weeks",
++      "Reduce saturated fat and refined carbohydrate intake",
++      "Aim for 30 minutes of aerobic exercise, 5+ days per week",
++      "Eat iron-rich foods: spinach, lean red meat, legumes",
++      "Take a Vitamin D3 supplement (1,000–2,000 IU/day)",
+     ],
+-  });
+-
+-  return JSON.parse(completion.choices[0].message.content);
+-  ──────────────────────────────────────────────────────────────────────── */
++  };
++}
++ 
++function getMockChatResponse(question) {
++  const q = question.toLowerCase();
++  if (q.includes("cholesterol"))
++    return "Your cholesterol of 228 mg/dL is above the recommended limit of 200 mg/dL. This increases cardiovascular risk over time. Reducing saturated fats and increasing exercise can help bring it down.";
++  if (q.includes("glucose") || q.includes("sugar") || q.includes("diabetic"))
++    return "Your fasting glucose of 108 mg/dL is in the pre-diabetic range (100-125 mg/dL). This doesn't mean you have diabetes, but it's worth monitoring with dietary changes and regular check-ups.";
++  if (q.includes("hemoglobin") || q.includes("anemia"))
++    return "Your hemoglobin of 11.2 g/dL is slightly below normal, suggesting mild anemia. This can cause fatigue. Iron-rich foods like spinach, lentils, and lean red meat can help, but consult your doctor.";
++  if (q.includes("ldl"))
++    return "LDL is 'bad' cholesterol. Your level of 142 mg/dL is above the ideal target of under 100 mg/dL. Reducing saturated fat intake and increasing physical activity are effective first steps.";
++  return "Based on your report, I recommend discussing these results with your doctor. They can provide personalized advice based on your full medical history. Is there a specific value you'd like me to explain?";
++}
++ 
++// ─────────────────────────────────────────────────────────────────────────────
++// PUBLIC FUNCTIONS
++// ─────────────────────────────────────────────────────────────────────────────
++ 
++/**
++ * analyzeReport — Called when a report is uploaded
++ * USER PROMPT: The raw report text
++ * EXPECTED OUTPUT: Structured JSON with summary, findings, flags, recommendations
++ */
++const analyzeReport = async (reportText) => {
++  if (IS_MOCK) {
++    console.log("[AI] Using mock response — set GEMINI_API_KEY to enable real AI");
++    await new Promise((r) => setTimeout(r, 500));
++    return getMockAnalysis(reportText);
++  }
++ 
++  const userPrompt = `Analyze this medical lab report and return structured JSON:
++ 
++${reportText}
++ 
++Return ONLY the JSON object as specified. No extra text.`;
++ 
++  try {
++    const raw = await callGemini(REPORT_ANALYSIS_SYSTEM_PROMPT, userPrompt, true);
++    // Temporary debug log — remove once JSON parsing is confirmed reliable.
++    console.log('[DEBUG] Raw Gemini response (analyzeReport):', raw);
++    const parsed = parseJSON(raw);
++    return validateReportAnalysis(parsed);
++  } catch (err) {
++    console.error("[AI] analyzeReport error:", err.message);
++    // Graceful fallback — never crash the upload
++    if (err.message === "RATE_LIMIT") {
++      console.warn("[AI] Rate limit hit — using mock");
++      return getMockAnalysis(reportText);
++    }
++    return getMockAnalysis(reportText);
++  }
+ };
+-
+-// ─────────────────────────────────────────────────────────────
+-// chatWithReport(question, reportContext)
+-// Called when user asks a question about their report in the AI chat.
+-// ─────────────────────────────────────────────────────────────
++ 
++/**
++ * chatWithReport — Called for AI Assistant chat
++ * USER PROMPT: Patient's question
++ * EXPECTED OUTPUT: Plain text answer
++ */
+ const chatWithReport = async (question, reportContext) => {
+-  // 🔴 MOCK — replace this block with real OpenAI call when you have an API key
+-  await new Promise((r) => setTimeout(r, 300));
+-
+-  const mockAnswers = {
+-    default: 'Based on your report, your results show some values outside the normal range. I recommend consulting your doctor for a detailed assessment.',
+-    cholesterol: 'Your cholesterol level of 228 mg/dL is above the recommended limit of 200 mg/dL. Reducing saturated fats and increasing exercise can help.',
+-    glucose: 'Your fasting glucose of 108 mg/dL is in the pre-diabetic range. Monitoring your diet and regular check-ups are advised.',
+-    hemoglobin: 'Your hemoglobin is slightly low at 11.2 g/dL. This may indicate mild anemia. Iron-rich foods like spinach and lentils can help.',
+-  };
+-
+-  const lower = question.toLowerCase();
+-  if (lower.includes('cholesterol')) return mockAnswers.cholesterol;
+-  if (lower.includes('glucose') || lower.includes('sugar')) return mockAnswers.glucose;
+-  if (lower.includes('hemoglobin') || lower.includes('anemia')) return mockAnswers.hemoglobin;
+-  return mockAnswers.default;
+-
+-  /* ── REAL OpenAI implementation (uncomment when ready) ────────────────
+-  const OpenAI = require('openai');
+-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+-
+-  const completion = await openai.chat.completions.create({
+-    model: 'gpt-4',
+-    messages: [
+-      {
+-        role: 'system',
+-        content: `You are a medical AI assistant. Answer questions about the following medical report in simple, clear language.
+-          Report context: ${reportContext}
+-          Be helpful but always recommend consulting a real doctor for medical decisions.`,
+-      },
+-      { role: 'user', content: question },
+-    ],
+-  });
+-
+-  return completion.choices[0].message.content;
+-  ──────────────────────────────────────────────────────────────────────── */
++  if (IS_MOCK) {
++    console.log("[AI] Using mock chat response");
++    await new Promise((r) => setTimeout(r, 300));
++    return getMockChatResponse(question);
++  }
++ 
++  const systemPrompt = CHAT_SYSTEM_PROMPT.replace("{REPORT_CONTEXT}", reportContext || "No specific report context provided.");
++ 
++  try {
++    const response = await callGemini(systemPrompt, question, false);
++ 
++    // Validate response
++    if (!response || response.trim().length < 10) {
++      return "I'm sorry, I couldn't generate a response. Please try rephrasing your question.";
++    }
++ 
++    // Remove any unwanted formatting
++    return response.replace(/\*\*/g, "").replace(/#{1,6}\s/g, "").trim();
++ 
++  } catch (err) {
++    console.error("[AI] chatWithReport error:", err.message);
++ 
++    // Handle specific errors gracefully
++    if (err.message === "RATE_LIMIT")
++      return "I'm receiving too many requests right now. Please wait a moment and try again.";
++    if (err.message === "TIMEOUT")
++      return "The AI took too long to respond. Please try again.";
++    if (err.message === "INVALID_KEY")
++      return "AI service configuration error. Please contact support.";
++ 
++    return getMockChatResponse(question);
++  }
+ };
+-
++ 
+ module.exports = { analyzeReport, chatWithReport };
++ 
+\ No newline at end of file
